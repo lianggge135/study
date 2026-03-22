@@ -1,0 +1,27 @@
+.app {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+  background: #f5f7fa;
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.resizer {
+  width: 4px;
+  background: transparent;
+  cursor: col-resize;
+  transition: background 0.2s;
+}
+
+.resizer:hover {
+  background: #1890ff;
+}
+
+.resizing {
+  background: #1890ff;
+}
