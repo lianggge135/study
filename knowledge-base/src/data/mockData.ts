@@ -1,4 +1,8 @@
 import type { TreeNode, Conversation } from '../types';
+import { pipeline, env } from '@huggingface/transformers';
+
+// Configure transformers.js to use local cache
+env.cacheDir = './models';
 
 export const mockKnowledgeBase: TreeNode[] = [
   {
@@ -283,17 +287,48 @@ export const mockConversations: Conversation[] = [
   }
 ];
 
+// ============== Semantic Search Implementation ==============
+
 interface SearchResult {
+  id: string;
   title: string;
   content: string;
   breadcrumb: string[];
   relevance: number;
 }
 
-function extractAllDocuments(nodes: TreeNode[], results: SearchResult[] = []): SearchResult[] {
-  for (const node of nodes) {
+// Embedding model - using Xenia (multilingual model, good for Chinese)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let embedder: any = null;
+let embeddingCache: Map<string, number[]> = new Map();
+let docEmbeddings: Map<string, number[]> = new Map();
+
+// Cosine similarity
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length !== b.length) return 0;
+
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+  return denominator === 0 ? 0 : dotProduct / denominator;
+}
+
+// Extract all documents from knowledge base
+function extractAllDocuments(nodes: TreeNode[]): SearchResult[] {
+  const results: SearchResult[] = [];
+
+  function traverse(node: TreeNode) {
     if (node.type === 'document' && node.content) {
       results.push({
+        id: node.id,
         title: node.content.title,
         content: node.content.content,
         breadcrumb: node.content.breadcrumb,
@@ -301,142 +336,181 @@ function extractAllDocuments(nodes: TreeNode[], results: SearchResult[] = []): S
       });
     }
     if (node.children) {
-      extractAllDocuments(node.children, results);
+      node.children.forEach(traverse);
     }
   }
+
+  nodes.forEach(traverse);
   return results;
 }
 
-function extractKeywords(text: string): string[] {
-  const keywords: string[] = [];
-  
-  const words = text.split(/[\s,，。！？、；：""''（）【】《》\n\r\t]+/).filter(w => w.length > 0);
-  keywords.push(...words);
-  
-  for (let i = 0; i < text.length; i++) {
-    for (let len = 2; len <= 4; len++) {
-      if (i + len <= text.length) {
-        const char = text[i];
-        if (/[\u4e00-\u9fa5]/.test(char)) {
-          keywords.push(text.slice(i, i + len));
-        }
+// Generate embedding for text
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function getEmbedding(text: string, embedderInstance: any): Promise<number[]> {
+  // Check cache first
+  const cacheKey = text.slice(0, 100);
+  if (embeddingCache.has(cacheKey)) {
+    return embeddingCache.get(cacheKey)!;
+  }
+
+  const embedding = await embedderInstance(text, {
+    pooling: 'mean',
+    normalize: true
+  }) as unknown as number[];
+
+  embeddingCache.set(cacheKey, embedding);
+  return embedding;
+}
+
+// Initialize the embedding model
+let modelLoadingPromise: Promise<void> | null = null;
+
+export async function initEmbeddingModel(): Promise<void> {
+  if (embedder) return;
+
+  if (modelLoadingPromise) {
+    return modelLoadingPromise;
+  }
+
+  modelLoadingPromise = (async () => {
+    console.log('🔄 正在加载语义嵌入模型 (首次加载约需1-2分钟)...');
+
+    // Using a multilingual model that supports Chinese well
+    embedder = await pipeline(
+      'feature-extraction',
+      'Xenova/all-MiniLM-L6-v2',  // Smaller, faster model
+      {
+        device: 'cpu',  // Explicitly use CPU
       }
+    );
+
+    console.log('✅ 语义嵌入模型加载完成');
+
+    // Pre-compute document embeddings
+    const docs = extractAllDocuments(mockKnowledgeBase);
+    console.log(`📚 正在预计算 ${docs.length} 篇文档的嵌入向量...`);
+
+    for (const doc of docs) {
+      const combinedText = `${doc.title} ${doc.content}`;
+      const embedding = await getEmbedding(combinedText, embedder);
+      docEmbeddings.set(doc.id, embedding);
     }
-  }
-  
-  return [...new Set(keywords)];
+
+    console.log('✅ 文档嵌入预计算完成');
+  })();
+
+  return modelLoadingPromise;
 }
 
-function calculateRelevance(question: string, document: SearchResult): number {
-  const questionLower = question.toLowerCase();
-  const keywords = extractKeywords(questionLower);
-  
-  const titleLower = document.title.toLowerCase();
-  const contentLower = document.content.toLowerCase();
-  
-  let score = 0;
-  
-  for (const keyword of keywords) {
-    if (keyword.length < 2) continue;
-    
-    if (titleLower.includes(keyword)) {
-      score += 10 * keyword.length;
-    }
-    
-    const contentMatches = (contentLower.match(new RegExp(keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
-    score += contentMatches * keyword.length;
-  }
-  
-  const exactPhrases = [
-    { pattern: /如何|怎么|怎样|方法/, weight: 1 },
-    { pattern: /什么|是什么|含义/, weight: 1 },
-    { pattern: /为什么|原因/, weight: 1 },
-    { pattern: /功能|特性|特点/, weight: 1 },
-    { pattern: /API|接口|调用/, weight: 2 },
-    { pattern: /架构|设计|技术栈/, weight: 2 },
-    { pattern: /新建|创建|添加/, weight: 1 },
-    { pattern: /收藏|保存/, weight: 1 },
-    { pattern: /位于|位置|在哪|哪里|地理/, weight: 2 },
-    { pattern: /首都|城市|国家/, weight: 2 },
-    { pattern: /人口|面积/, weight: 2 }
-  ];
-  
-  for (const { pattern, weight } of exactPhrases) {
-    if (pattern.test(questionLower) && pattern.test(contentLower)) {
-      score += weight * 5;
-    }
-  }
-  
-  return score;
+// Check if model is ready
+export function isEmbeddingModelReady(): boolean {
+  return embedder !== null;
 }
 
-function extractRelevantContent(question: string, content: string, maxLength: number = 500): string {
-  const questionLower = question.toLowerCase();
-  const keywords = extractKeywords(questionLower);
-  
+// Find relevant content using semantic similarity
+export async function findRelevantDocuments(
+  question: string,
+  knowledgeBase: TreeNode[]
+): Promise<SearchResult[]> {
+  if (!embedder) {
+    console.warn('Embedding model not initialized');
+    return [];
+  }
+
+  const docs = extractAllDocuments(knowledgeBase);
+
+  // Get question embedding
+  const questionEmbedding = await getEmbedding(question, embedder);
+
+  // Calculate similarities
+  for (const doc of docs) {
+    const docEmbedding = docEmbeddings.get(doc.id);
+    if (docEmbedding) {
+      doc.relevance = cosineSimilarity(questionEmbedding, docEmbedding);
+    }
+  }
+
+  // Sort by relevance
+  docs.sort((a, b) => b.relevance - a.relevance);
+
+  return docs;
+}
+
+// Extract relevant content from document based on question
+function extractRelevantContent(_question: string, content: string, maxLength: number = 600): string {
+  // Simple content chunking - split by paragraphs and return most relevant ones
   const lines = content.split('\n').filter(line => line.trim());
-  
-  const relevantLines: string[] = [];
-  let currentLength = 0;
-  
+
+  // If content is short enough, return it all
+  if (content.length <= maxLength) {
+    return content;
+  }
+
+  // Otherwise, return first part with key sections
+  let result = '';
   for (const line of lines) {
-    const lineLower = line.toLowerCase();
-    const isRelevant = keywords.some(keyword => keyword.length >= 2 && lineLower.includes(keyword)) ||
-                       line.startsWith('##') ||
-                       line.startsWith('###') ||
-                       line.startsWith('**') ||
-                       line.startsWith('- ') ||
-                       line.startsWith('1. ') ||
-                       line.startsWith('2. ') ||
-                       line.startsWith('3. ');
-    
-    if (isRelevant && currentLength + line.length < maxLength) {
-      relevantLines.push(line);
-      currentLength += line.length;
+    if (result.length + line.length > maxLength) {
+      break;
+    }
+    if (line.startsWith('##') || line.startsWith('###') || line.startsWith('**') || line.startsWith('- ')) {
+      result += line + '\n';
     }
   }
-  
-  if (relevantLines.length === 0) {
-    return content.slice(0, maxLength) + (content.length > maxLength ? '...' : '');
+
+  // Fallback to beginning of content
+  if (!result) {
+    result = content.slice(0, maxLength) + (content.length > maxLength ? '...' : '');
   }
-  
-  return relevantLines.join('\n');
+
+  return result || content.slice(0, maxLength);
 }
 
-export function generateKnowledgeBasedResponse(question: string, knowledgeBase: TreeNode[]): string {
-  const documents = extractAllDocuments(knowledgeBase);
-  
-  for (const doc of documents) {
-    doc.relevance = calculateRelevance(question, doc);
+// Generate response using semantic search
+export async function generateKnowledgeBasedResponse(
+  question: string,
+  knowledgeBase: TreeNode[]
+): Promise<string> {
+  // Fallback if model not loaded yet
+  if (!embedder) {
+    return `⏳ 语义模型正在加载中，请稍后再试...\n\n或者刷新页面等待模型加载完成。`;
   }
-  
-  documents.sort((a, b) => b.relevance - a.relevance);
-  
-  const relevantDocs = documents.filter(doc => doc.relevance > 0).slice(0, 3);
-  
+
+  const documents = await findRelevantDocuments(question, knowledgeBase);
+  const relevantDocs = documents.filter(doc => doc.relevance > 0.15).slice(0, 3);
+
   if (relevantDocs.length === 0) {
-    return `抱歉，我在知识库中没有找到与"${question}"直接相关的内容。\n\n您可以：\n1. 尝试使用不同的关键词重新提问\n2. 在左侧知识库目录中浏览相关文档\n3. 联系管理员添加相关文档`;
+    return `抱歉，我在知识库中没有找到与"${question}"语义相关的内容。\n\n您可以：\n1. 尝试使用不同的表述方式提问\n2. 在左侧知识库目录中浏览相关文档\n3. 联系管理员添加相关文档`;
   }
-  
-  let response = `根据知识库内容，为您找到以下相关信息：\n\n`;
-  
+
+  let response = `🔍 根据语义匹配，为您找到以下相关信息：\n\n`;
+
   relevantDocs.forEach((doc, index) => {
     const relevantContent = extractRelevantContent(question, doc.content);
-    response += `### 📄 ${doc.title}\n`;
+    const similarityPercent = Math.round(doc.relevance * 100);
+    response += `### 📄 ${doc.title} (匹配度: ${similarityPercent}%)\n`;
     response += `> 来源：${doc.breadcrumb.join(' > ')}\n\n`;
     response += `${relevantContent}\n\n`;
     if (index < relevantDocs.length - 1) {
       response += `---\n\n`;
     }
   });
-  
+
   if (relevantDocs.length > 1) {
     response += `\n💡 **提示**：以上内容来自 ${relevantDocs.length} 篇相关文档，如需更详细的信息，可以在左侧目录中查看完整文档。`;
   }
-  
+
   return response;
 }
 
+// Legacy sync version (for compatibility)
+export function generateKnowledgeBasedResponseSync(
+  _question: string,
+  _knowledgeBase: TreeNode[]
+): string {
+  return `⏳ 语义模型正在加载中...\n\n请稍后再试，或刷新页面重新加载。`;
+}
+
+// Mock response function (kept for fallback)
 export const mockAIResponse = (question: string): string => {
   const responses = [
     `根据知识库内容，关于"${question}"的问题，我为您整理了以下信息：\n\n这是一个很好的问题。知识库中有多篇相关文档可以参考。\n\n建议您查看相关文档获取更详细的信息。`,

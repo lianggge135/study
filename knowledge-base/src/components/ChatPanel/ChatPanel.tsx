@@ -6,15 +6,16 @@ interface ChatPanelProps {
   conversation: Conversation | null;
   onSendMessage: (content: string) => void;
   onToggleFavorite: (messageId: string) => void;
+  isAiLoading?: boolean;
 }
 
 export default function ChatPanel({
   conversation,
   onSendMessage,
-  onToggleFavorite
+  onToggleFavorite,
+  isAiLoading = false
 }: ChatPanelProps) {
   const [inputValue, setInputValue] = useState('');
-  const [isTyping, setIsTyping] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -27,16 +28,11 @@ export default function ChatPanel({
   }, [conversation?.messages]);
 
   const handleSend = () => {
-    if (!inputValue.trim() || isTyping) return;
+    if (!inputValue.trim() || isAiLoading) return;
 
     const message = inputValue.trim();
     setInputValue('');
     onSendMessage(message);
-    
-    setIsTyping(true);
-    setTimeout(() => {
-      setIsTyping(false);
-    }, 1000 + Math.random() * 1000);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -152,7 +148,7 @@ export default function ChatPanel({
           </div>
         ))}
         
-        {isTyping && (
+        {isAiLoading && (
           <div className={`${styles.message} ${styles['message-assistant']}`}>
             <div className={styles['message-avatar']}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -186,7 +182,7 @@ export default function ChatPanel({
           <button
             className={styles['send-btn']}
             onClick={handleSend}
-            disabled={!inputValue.trim() || isTyping}
+            disabled={!inputValue.trim() || isAiLoading}
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <line x1="22" y1="2" x2="11" y2="13" />
